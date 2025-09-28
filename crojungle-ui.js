@@ -135,56 +135,74 @@ import * as THREE from 'three';
   (function loop(){ renderer.render(scene, camera); requestAnimationFrame(loop); })();
 
   // ===== SNAPSHOT (no feedback; concurrency guard) =====
-  let snapping = false;
-  async function snapshot(rect){
-    const h2c = window.html2canvas;
-    uniforms.uCorner.value = Math.min(LENS.corner, rect.h * 0.5 - 1);
-    if (!h2c || snapping) { uniforms.uHasBG.value = 0.0; return; }
-    snapping = true;
+let snapping = false;
+let lastSnapAt = 0;
+function navBgColor() {
+  // Use the computed background (fallback to your dark nav color)
+  const c = getComputedStyle(nav).backgroundColor;
+  return c && c !== 'rgba(0, 0, 0, 0)' ? c : '#0b1221';
+}
 
-    const prevDisplay = pill.style.display;
-    try {
-      pill.style.display = 'none'; // ensure the pill itself isn't captured
-      const scale = Math.min(window.devicePixelRatio || 1, 2);
-      const full = await h2c(nav, {
-        backgroundColor: null,
-        useCORS: true,
-        scale,
-        logging: false,
-        ignoreElements: el => el === pill || pill.contains(el)
-      });
+async function snapshot(rect) {
+  const h2c = window.html2canvas;
+  uniforms.uCorner.value = Math.min(LENS.corner, rect.h * 0.5 - 1);
 
-      const nr = nav.getBoundingClientRect();
-      const sx = Math.max(0, Math.round(rect.x * (full.width  / nr.width)));
-      const sy = Math.max(0, Math.round(rect.y * (full.height / nr.height)));
-      const sw = Math.max(2, Math.round(rect.w * (full.width  / nr.width)));
-      const sh = Math.max(2, Math.round(rect.h * (full.height / nr.height)));
+  // throttle snapshots (avoid flicker)
+  const now = performance.now();
+  if (!h2c || snapping || (now - lastSnapAt) < 180) { uniforms.uHasBG.value = 0.0; return; }
+  snapping = true;
 
-      const crop = document.createElement('canvas');
-      crop.width = sw; crop.height = sh;
-      crop.getContext('2d').drawImage(full, sx, sy, sw, sh, 0, 0, sw, sh);
+  const prevOpacity = pill.style.opacity;
+  try {
+    // hide visually but keep layout stable
+    pill.style.opacity = '0';
 
-      const tex = new THREE.CanvasTexture(crop);
-      tex.colorSpace = THREE.SRGBColorSpace;
-      tex.minFilter = THREE.LinearFilter;
-      tex.magFilter = THREE.LinearFilter;
-      tex.wrapS = THREE.ClampToEdgeWrapping;
-      tex.wrapT = THREE.ClampToEdgeWrapping;
-      tex.generateMipmaps = false;
+    const scale = Math.min(window.devicePixelRatio || 1, 2);
+    const full = await h2c(nav, {
+      backgroundColor: null,         // we’ll fill the crop manually
+      useCORS: true,
+      scale,
+      logging: false,
+      ignoreElements: el => el === pill || pill.contains(el)
+    });
 
-      uniforms.uBG.value?.dispose?.();
-      uniforms.uBG.value = tex;
-      uniforms.uRes.value.set(rect.w, rect.h);
-      uniforms.uHasBG.value = 1.0;
-    } catch(e){
-      console.warn('[pill] snapshot failed; fallback only:', e);
-      uniforms.uHasBG.value = 0.0;
-    } finally {
-      pill.style.display = prevDisplay || '';
-      snapping = false;
-    }
+    const nr = nav.getBoundingClientRect();
+    const sx = Math.max(0, Math.round(rect.x * (full.width  / nr.width)));
+    const sy = Math.max(0, Math.round(rect.y * (full.height / nr.height)));
+    const sw = Math.max(2, Math.round(rect.w * (full.width  / nr.width)));
+    const sh = Math.max(2, Math.round(rect.h * (full.height / nr.height)));
+
+    // Prefill crop with the nav background color to avoid “transparent black”
+    const crop = document.createElement('canvas');
+    crop.width = sw; crop.height = sh;
+    const ctx = crop.getContext('2d');
+    ctx.fillStyle = navBgColor();
+    ctx.fillRect(0, 0, sw, sh);
+    // Draw the snapshot on top (expanded by 1px to avoid edge seams)
+    ctx.drawImage(full, sx - 1, sy - 1, sw + 2, sh + 2, -1, -1, sw + 2, sh + 2);
+
+    const tex = new THREE.CanvasTexture(crop);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.generateMipmaps = false;
+
+    uniforms.uBG.value?.dispose?.();
+    uniforms.uBG.value = tex;
+    uniforms.uRes.value.set(rect.w, rect.h);
+    uniforms.uHasBG.value = 1.0;
+
+    lastSnapAt = performance.now();
+  } catch (e) {
+    console.warn('[pill] snapshot failed; using fallback only:', e);
+    uniforms.uHasBG.value = 0.0;
+  } finally {
+    pill.style.opacity = prevOpacity || '1';
+    snapping = false;
   }
-
+}
   // ===== MOVEMENT =====
   let last = { x:0, y:0, w:140, h:56 };
   let anim = 0, t0 = 0, from = { ...last }, to = { ...last }, backTimer = null;
@@ -213,7 +231,12 @@ import * as THREE from 'three';
     const r = { x:from.x+(to.x-from.x)*k, y:from.y+(to.y-from.y)*k,
                 w:from.w+(to.w-from.w)*k, h:from.h+(to.h-from.h)*k };
     apply(r);
-    if (t < 1) anim = requestAnimationFrame(step); else snapshot(r);
+   if (t < 1) {
+  anim = requestAnimationFrame(step);
+} else {
+  // slight delay so we don't reshoot if the user immediately moves again
+  setTimeout(() => snapshot(r), 60);
+}
   }
 
   // Wire up
